@@ -124,29 +124,14 @@ func (s *Scheduler) scheduleTask(task models.Task, startDate time.Time, daySlots
 	remainingHours := task.HoursRequired
 	currentDate := s.normalizeDate(startDate)
 
-	// Calculate latest possible start date if there's a deadline
-	var latestStartDate time.Time
-	if task.Deadline != nil {
-		// Work backwards from deadline to understand the latest admissible start
-		latestStartDate = s.calculateLatestStartDate(*task.Deadline, task.HoursRequired)
-		if latestStartDate.Before(currentDate) {
-			// Task can't be completed before deadline at all
-			return false
-		}
-	}
-
 	// Try to allocate hours across available days, but not beyond configured planning horizon.
 	// Primary strategy for tasks with дедлайном — начинать планирование как можно ближе к дедлайну
 	// (обратное планирование), но не раньше startDate / latestStartDate.
 	maxDaysToCheck := s.planningHorizonDays
 	daysChecked := 0
 
-	// If we have a deadline, start from the later of startDate and latestStartDate
-	if task.Deadline != nil {
-		if currentDate.Before(latestStartDate) {
-			currentDate = latestStartDate
-		}
-	}
+	// If we have a deadline, we could in будущем использовать latestStartDate,
+	// но сейчас просто идём вперёд от currentDate и проверяем дедлайн по условию ниже.
 
 	for remainingHours > 0 && daysChecked < maxDaysToCheck {
 		// Check if this day is a work day
@@ -211,12 +196,21 @@ func (s *Scheduler) calculateLatestStartDate(deadline time.Time, hoursRequired f
 		return s.normalizeDate(deadline)
 	}
 
-	// Use ceiling to calculate exact number of required work days
+	// Use ceiling to calculate exact number of required work days.
+	// Дедлайн считаем включительно, поэтому:
+	// - deadline сам считается рабочим днём №1 (если он рабочий),
+	// - затем двигаемся назад, пока не наберём нужное количество рабочих дней.
 	workDaysNeeded := int(math.Ceil(hoursRequired / s.user.DailyCapacity))
 	date := deadline
-	workDaysFound := 0
 
-	// Go backwards from deadline
+	// Если дедлайн не рабочий день, отступаем назад до ближайшего рабочего.
+	for !s.isWorkDay(date) {
+		date = date.AddDate(0, 0, -1)
+	}
+
+	workDaysFound := 1
+
+	// Go backwards from adjusted deadline
 	for workDaysFound < workDaysNeeded {
 		date = date.AddDate(0, 0, -1)
 		if s.isWorkDay(date) {
