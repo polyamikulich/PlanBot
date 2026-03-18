@@ -274,7 +274,7 @@ func (h *BotHandler) handleSchedule(msg *tgbotapi.Message) {
 
 	h.sendMessage(msg.Chat.ID, "🔄 Планирую задачи...")
 
-	// Run scheduler
+	// Run scheduler starting from tomorrow (планируем всегда с завтрашнего дня)
 	s := scheduler.NewScheduler(user, tasks)
 	now := time.Now()
 	if user.TimeZone != "" {
@@ -282,7 +282,8 @@ func (h *BotHandler) handleSchedule(msg *tgbotapi.Message) {
 			now = now.In(loc)
 		}
 	}
-	result := s.Schedule(now)
+	startDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, 1)
+	result := s.Schedule(startDate)
 
 	// Clear old schedules for these tasks
 	taskIDs := make([]int64, len(tasks))
@@ -348,103 +349,155 @@ func (h *BotHandler) handleScheduleSlots(msg *tgbotapi.Message) {
 
 	h.sendMessage(msg.Chat.ID, "🧪 Экспериментальное планирование по временным слотам...\n(данные в БД не изменяются)")
 
-	// Prepare start time in user's time zone
+	// Используем тот же планировщик, что и /schedule, чтобы результат по дням совпадал.
+	s := scheduler.NewScheduler(user, tasks)
 	now := time.Now()
 	if user.TimeZone != "" {
 		if loc, err := time.LoadLocation(user.TimeZone); err == nil {
 			now = now.In(loc)
 		}
 	}
+	startDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, 1)
+	planResult := s.Schedule(startDate)
 
-	// Build and fill slots
-	slotScheduler := scheduler.NewSlotScheduler(user)
-	slots := slotScheduler.BuildDailySlots(now)
-	slots = slotScheduler.AssignTasksToSlots(tasks, slots)
-
-	// Build a map of tasks by ID for metadata
-	taskByID := make(map[int64]models.Task, len(tasks))
-	for _, t := range tasks {
-		taskByID[t.ID] = t
+	if len(planResult.DaySchedules) == 0 {
+		h.sendMessage(msg.Chat.ID, "🔎 Нет расписания для отображения по слотам. Сначала добавьте задачи.")
+		return
 	}
 
-	// Aggregate slots into day schedules in-memory (do not touch DB)
+	// Генерируем слоты и равномерно раскладываем внутри рабочего дня уже запланированные часы.
+	slotScheduler := scheduler.NewSlotScheduler(user)
+	slots := slotScheduler.BuildDailySlots(startDate)
+
+	// Индекс слотов по дате
+	slotsByDate := make(map[string][]*models.TimeSlot)
+	for i := range slots {
+		key := slots[i].Date.Format("2006-01-02")
+		s := &slots[i]
+		slotsByDate[key] = append(slotsByDate[key], s)
+	}
+
+	// Для каждого дня из плана равномерно заполняем слоты задачами этого дня.
+	for _, day := range planResult.DaySchedules {
+		dateKey := day.Date.Format("2006-01-02")
+		daySlots := slotsByDate[dateKey]
+		if len(daySlots) == 0 {
+			continue
+		}
+
+		// Последовательно проходим задачи этого дня и распределяем их часы по доступным слотам.
+		slotIdx := 0
+		for _, t := range day.Tasks {
+			remaining := t.HoursAllocated
+			for remaining > 0 && slotIdx < len(daySlots) {
+				slot := daySlots[slotIdx]
+				free := slot.CapacityHours - slot.AllocatedHours
+				if free <= 0 {
+					slotIdx++
+					continue
+				}
+
+				toAllocate := remaining
+				if toAllocate > free {
+					toAllocate = free
+				}
+
+				slot.AllocatedHours += toAllocate
+				if toAllocate > 0 {
+					idCopy := t.TaskID
+					slot.TaskID = &idCopy
+					if slot.Source == "" {
+						slot.Source = "task"
+					}
+				}
+
+				remaining -= toAllocate
+				if slot.AllocatedHours >= slot.CapacityHours {
+					slotIdx++
+				}
+			}
+		}
+	}
+
+	// Теперь у нас есть заполненные слоты, сворачиваем их обратно в DaySchedule только для показа.
 	type aggTask struct {
 		info models.ScheduledTaskInfo
 	}
 
-	dayAgg := make(map[string]map[int64]*aggTask)
-	dateByKey := make(map[string]time.Time)
+	dayAgg := make(map[string]models.DaySchedule)
 
 	for _, slot := range slots {
 		if slot.TaskID == nil || slot.AllocatedHours <= 0 {
 			continue
 		}
-		task, ok := taskByID[*slot.TaskID]
-		if !ok {
-			continue
-		}
 
 		dateKey := slot.Date.Format("2006-01-02")
-		dateByKey[dateKey] = slot.Date
-
-		taskMap, exists := dayAgg[dateKey]
+		ds, exists := dayAgg[dateKey]
 		if !exists {
-			taskMap = make(map[int64]*aggTask)
-			dayAgg[dateKey] = taskMap
-		}
-
-		agg, exists := taskMap[task.ID]
-		if !exists {
-			agg = &aggTask{
-				info: models.ScheduledTaskInfo{
-					TaskID:         task.ID,
-					Title:          task.Title,
-					HoursAllocated: 0,
-					Priority:       task.Priority,
-					Deadline:       task.Deadline,
-				},
+			ds = models.DaySchedule{
+				Date:           slot.Date,
+				Tasks:          []models.ScheduledTaskInfo{},
+				TotalHours:     0,
+				AvailableHours: user.DailyCapacity,
 			}
-			taskMap[task.ID] = agg
 		}
 
-		agg.info.HoursAllocated += slot.AllocatedHours
+		// Ищем задачу в уже существующем списке
+		found := false
+		for i := range ds.Tasks {
+			if ds.Tasks[i].TaskID == *slot.TaskID {
+				ds.Tasks[i].HoursAllocated += slot.AllocatedHours
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Берём базовую информацию из исходного плана
+			var baseInfo *models.ScheduledTaskInfo
+			for _, d := range planResult.DaySchedules {
+				if d.Date.Format("2006-01-02") != dateKey {
+					continue
+				}
+				for _, ti := range d.Tasks {
+					if ti.TaskID == *slot.TaskID {
+						copy := ti
+						baseInfo = &copy
+						break
+					}
+				}
+				if baseInfo != nil {
+					break
+				}
+			}
+			if baseInfo == nil {
+				// fallback: минимальная информация
+				baseInfo = &models.ScheduledTaskInfo{
+					TaskID: *slot.TaskID,
+				}
+			}
+			baseInfo.HoursAllocated = slot.AllocatedHours
+			ds.Tasks = append(ds.Tasks, *baseInfo)
+		}
+
+		ds.TotalHours += slot.AllocatedHours
+		dayAgg[dateKey] = ds
 	}
 
-	// Convert aggregates to []DaySchedule
+	if len(dayAgg) == 0 {
+		h.sendMessage(msg.Chat.ID, "🔎 Слотный просмотр: нет слотов с задачами (возможно, все задачи с нулевой длительностью).")
+		return
+	}
+
+	// Преобразуем в слайс и сортируем по дате
 	var daySchedules []models.DaySchedule
-	for key, tasksMap := range dayAgg {
-		date := dateByKey[key]
-		ds := models.DaySchedule{
-			Date:           date,
-			Tasks:          []models.ScheduledTaskInfo{},
-			TotalHours:     0,
-			AvailableHours: user.DailyCapacity,
-		}
-
-		for _, agg := range tasksMap {
-			if agg.info.HoursAllocated <= 0 {
-				continue
-			}
-			ds.Tasks = append(ds.Tasks, agg.info)
-			ds.TotalHours += agg.info.HoursAllocated
-		}
-
-		if len(ds.Tasks) > 0 {
-			daySchedules = append(daySchedules, ds)
-		}
+	for _, ds := range dayAgg {
+		daySchedules = append(daySchedules, ds)
 	}
-
-	// Sort day schedules by date
 	sort.Slice(daySchedules, func(i, j int) bool {
 		return daySchedules[i].Date.Before(daySchedules[j].Date)
 	})
 
-	if len(daySchedules) == 0 {
-		h.sendMessage(msg.Chat.ID, "🔎 Слотный алгоритм не смог разместить задачи в доступные временные окна.")
-		return
-	}
-
-	// Format response (preview only)
+	// Формируем ответ
 	response := "🧪 Экспериментальное расписание по слотам (временные окна):\n\n"
 
 	maxDays := 7
