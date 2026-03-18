@@ -1,7 +1,10 @@
 package scheduler
 
 import (
+	"math"
+	"os"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/adkhorst/planbot/models"
@@ -9,15 +12,24 @@ import (
 
 // Scheduler handles task scheduling logic
 type Scheduler struct {
-	user  *models.User
-	tasks []models.Task
+	user                *models.User
+	tasks               []models.Task
+	planningHorizonDays int
 }
 
 // NewScheduler creates a new scheduler instance
 func NewScheduler(user *models.User, tasks []models.Task) *Scheduler {
+	horizon := 365 // default: 1 year
+	if env := os.Getenv("PLANNING_HORIZON_DAYS"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			horizon = v
+		}
+	}
+
 	return &Scheduler{
-		user:  user,
-		tasks: tasks,
+		user:                user,
+		tasks:               tasks,
+		planningHorizonDays: horizon,
 	}
 }
 
@@ -115,17 +127,26 @@ func (s *Scheduler) scheduleTask(task models.Task, startDate time.Time, daySlots
 	// Calculate latest possible start date if there's a deadline
 	var latestStartDate time.Time
 	if task.Deadline != nil {
-		// Work backwards from deadline
+		// Work backwards from deadline to understand the latest admissible start
 		latestStartDate = s.calculateLatestStartDate(*task.Deadline, task.HoursRequired)
 		if latestStartDate.Before(currentDate) {
-			// Task can't be completed before deadline
+			// Task can't be completed before deadline at all
 			return false
 		}
 	}
 
-	// Try to allocate hours across available days
-	maxDaysToCheck := 365 // Don't look more than a year ahead
+	// Try to allocate hours across available days, but not beyond configured planning horizon.
+	// Primary strategy for tasks with дедлайном — начинать планирование как можно ближе к дедлайну
+	// (обратное планирование), но не раньше startDate / latestStartDate.
+	maxDaysToCheck := s.planningHorizonDays
 	daysChecked := 0
+
+	// If we have a deadline, start from the later of startDate and latestStartDate
+	if task.Deadline != nil {
+		if currentDate.Before(latestStartDate) {
+			currentDate = latestStartDate
+		}
+	}
 
 	for remainingHours > 0 && daysChecked < maxDaysToCheck {
 		// Check if this day is a work day
@@ -186,7 +207,12 @@ func (s *Scheduler) scheduleTask(task models.Task, startDate time.Time, daySlots
 
 // calculateLatestStartDate calculates the latest date a task can start
 func (s *Scheduler) calculateLatestStartDate(deadline time.Time, hoursRequired float64) time.Time {
-	workDaysNeeded := int(hoursRequired/s.user.DailyCapacity) + 1
+	if s.user.DailyCapacity <= 0 {
+		return s.normalizeDate(deadline)
+	}
+
+	// Use ceiling to calculate exact number of required work days
+	workDaysNeeded := int(math.Ceil(hoursRequired / s.user.DailyCapacity))
 	date := deadline
 	workDaysFound := 0
 
@@ -239,4 +265,161 @@ func (s *Scheduler) convertDaySlotsToSlice(daySlots map[string]*models.DaySchedu
 	})
 
 	return schedules
+}
+
+// SlotScheduler builds and manages fine-grained time slots within days.
+// It is not yet wired into the main scheduling flow and is prepared for future use.
+type SlotScheduler struct {
+	user        *models.User
+	slotMinutes int
+	horizonDays int
+}
+
+// NewSlotScheduler creates a new SlotScheduler with defaults based on environment.
+func NewSlotScheduler(user *models.User) *SlotScheduler {
+	horizon := 365
+	if env := os.Getenv("PLANNING_HORIZON_DAYS"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			horizon = v
+		}
+	}
+
+	slotMinutes := 60
+	if env := os.Getenv("PLANNING_SLOT_MINUTES"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			slotMinutes = v
+		}
+	}
+
+	return &SlotScheduler{
+		user:        user,
+		slotMinutes: slotMinutes,
+		horizonDays: horizon,
+	}
+}
+
+// BuildDailySlots generates in-memory time slots for working days
+// between startDate and startDate + horizon.
+func (s *SlotScheduler) BuildDailySlots(startDate time.Time) []models.TimeSlot {
+	var slots []models.TimeSlot
+
+	// Normalize start date to user's time zone and midnight
+	current := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, startDate.Location())
+
+	workStart := s.user.WorkStart
+	workEnd := s.user.WorkEnd
+	if workStart == "" {
+		workStart = "09:00"
+	}
+	if workEnd == "" {
+		workEnd = "18:00"
+	}
+
+	for day := 0; day < s.horizonDays; day++ {
+		if !s.isWorkDay(current) {
+			current = current.AddDate(0, 0, 1)
+			continue
+		}
+
+		// Parse working hours for this day
+		startClock, errStart := time.ParseInLocation("15:04", workStart, current.Location())
+		endClock, errEnd := time.ParseInLocation("15:04", workEnd, current.Location())
+		if errStart != nil || errEnd != nil || !endClock.After(startClock) {
+			// If working hours are invalid, skip slot generation for this day
+			current = current.AddDate(0, 0, 1)
+			continue
+		}
+
+		dayStart := time.Date(current.Year(), current.Month(), current.Day(), startClock.Hour(), startClock.Minute(), 0, 0, current.Location())
+		dayEnd := time.Date(current.Year(), current.Month(), current.Day(), endClock.Hour(), endClock.Minute(), 0, 0, current.Location())
+
+		slotDuration := time.Duration(s.slotMinutes) * time.Minute
+		for t := dayStart; t.Before(dayEnd); t = t.Add(slotDuration) {
+			end := t.Add(slotDuration)
+			if end.After(dayEnd) {
+				end = dayEnd
+			}
+
+			capacity := end.Sub(t).Hours()
+			slots = append(slots, models.TimeSlot{
+				UserID:         s.user.ID,
+				Date:           current,
+				Start:          t,
+				End:            end,
+				CapacityHours:  capacity,
+				AllocatedHours: 0,
+				TaskID:         nil,
+				Source:         "",
+			})
+		}
+
+		current = current.AddDate(0, 0, 1)
+	}
+
+	return slots
+}
+
+// isWorkDay checks if a date is a work day for the user (reuses user's WorkDays).
+func (s *SlotScheduler) isWorkDay(date time.Time) bool {
+	weekday := int(date.Weekday())
+	if weekday == 0 {
+		weekday = 7 // Sunday = 7
+	}
+
+	for _, workDay := range s.user.WorkDays {
+		if workDay == weekday {
+			return true
+		}
+	}
+	return false
+}
+
+// AssignTasksToSlots performs simple greedy assignment of tasks to free slots.
+// This function operates in-memory and does not persist any changes.
+func (s *SlotScheduler) AssignTasksToSlots(tasks []models.Task, slots []models.TimeSlot) []models.TimeSlot {
+	// Local copy of slots to modify
+	result := make([]models.TimeSlot, len(slots))
+	copy(result, slots)
+
+	// Reuse existing sorting rules from Scheduler
+	baseScheduler := NewScheduler(s.user, tasks)
+	sortedTasks := baseScheduler.sortTasksByDeadlineAndPriority(tasks)
+
+	for _, task := range sortedTasks {
+		remaining := task.HoursRequired
+		for i := range result {
+			if remaining <= 0 {
+				break
+			}
+
+			slot := &result[i]
+
+			// Skip slots that already fully occupied or belong to another task
+			if slot.AllocatedHours >= slot.CapacityHours {
+				continue
+			}
+
+			free := slot.CapacityHours - slot.AllocatedHours
+			if free <= 0 {
+				continue
+			}
+
+			toAllocate := remaining
+			if toAllocate > free {
+				toAllocate = free
+			}
+
+			slot.AllocatedHours += toAllocate
+			if toAllocate > 0 {
+				slot.TaskID = &task.ID
+				if slot.Source == "" {
+					slot.Source = "task"
+				}
+			}
+
+			remaining -= toAllocate
+		}
+	}
+
+	return result
 }

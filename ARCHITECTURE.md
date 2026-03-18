@@ -39,14 +39,20 @@
 │ models.go        │                   │                  │
 │                  │                   │ - Подключение    │
 │ - User           │                   │ - Connection     │
-│ - Task           │                   │   Pool           │
-│ - TaskSchedule   │                   └─────────┬────────┘
-│ - DaySchedule    │                             │
+│   (TimeZone,     │                   │   Pool           │
+│    WorkDays,     │                   └─────────┬────────┘
+│    WorkStart/End)│                             │
+│ - Task           │                             ▼
+│ - TaskSchedule   │                   ┌──────────────────┐
+│ - DaySchedule    │                   │   PostgreSQL     │
 └──────────────────┘                             ▼
-                                       ┌──────────────────┐
-                                       │   PostgreSQL     │
                                        │                  │
                                        │ - users          │
+                                       │   (daily_capacity,
+                                       │    work_days,
+                                       │    time_zone,
+                                       │    work_start,
+                                       │    work_end)
                                        │ - tasks          │
                                        │ - task_schedules │
                                        └──────────────────┘
@@ -90,7 +96,7 @@ HandleUpdate() → handleSchedule()
        └─→ scheduler.NewScheduler(user, tasks)
               │
               ▼
-       Schedule() [Алгоритм]
+       Schedule(startDateInUserTZ) [Алгоритм]
               │
               ├─→ sortTasksByDeadlineAndPriority()
               ├─→ scheduleTask() для каждой задачи
@@ -144,8 +150,11 @@ users
 ├─ username
 ├─ first_name
 ├─ last_name
-├─ daily_capacity (часов в день)
-├─ work_days (массив дней недели)
+├─ time_zone (строка, IANA name, по умолчанию Europe/Moscow)
+├─ work_start (время начала рабочего дня, HH:MM)
+├─ work_end (время окончания рабочего дня, HH:MM)
+├─ daily_capacity (часов в день, суммарная ёмкость)
+├─ work_days (массив рабочих дней недели)
 ├─ created_at
 └─ updated_at
 
@@ -204,21 +213,24 @@ tasks (1) ──< (N) task_schedules
 - `handleAddTask()` - добавление задачи
 - `handleSchedule()` - запуск планирования
 - `handleToday()/handleWeek()` - просмотр расписания
+- `handleSettings()` - изменение дневной ёмкости, рабочих дней и рабочего времени
+- `handleTimezone()` - установка таймзоны пользователя
 
 ### 3. scheduler/scheduler.go
 **Назначение**: Алгоритм планирования задач
 
 **Ответственность**:
-- Сортировка задач по приоритету
+- Сортировка задач по приоритету и дедлайнам
 - Распределение задач по дням
 - Учёт дедлайнов и рабочих дней
 - Разбиение задач на несколько дней
+- Учет горизонта планирования (`PLANNING_HORIZON_DAYS`)
 
 **Основные функции**:
-- `Schedule()` - главная функция планирования
-- `sortTasksByDeadlineAndPriority()` - сортировка
-- `scheduleTask()` - распределение одной задачи
-- `calculateLatestStartDate()` - расчет последней даты начала
+- `Schedule(startDate time.Time)` - главная функция планирования (стартовая дата уже приведена к таймзоне пользователя)
+- `sortTasksByDeadlineAndPriority()` - сортировка задач с дедлайнами и без
+- `scheduleTask()` - распределение одной задачи по дням с учетом рабочих дней и дедлайна
+- `calculateLatestStartDate()` - расчет последней допустимой даты начала с использованием `ceil(hours_required / daily_capacity)`
 
 **Алгоритм**: O(n × d), где n - задач, d - дней
 

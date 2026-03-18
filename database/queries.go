@@ -14,7 +14,7 @@ func GetOrCreateUser(telegramID int64, username, firstName, lastName string) (*m
 	user := &models.User{}
 
 	// Try to get existing user
-	query := `SELECT id, telegram_id, username, first_name, last_name, daily_capacity, work_days, created_at, updated_at
+	query := `SELECT id, telegram_id, username, first_name, last_name, time_zone, work_start, work_end, daily_capacity, work_days, created_at, updated_at
 			  FROM users WHERE telegram_id = $1`
 
 	var workDays pq.Int64Array
@@ -24,6 +24,9 @@ func GetOrCreateUser(telegramID int64, username, firstName, lastName string) (*m
 		&user.Username,
 		&user.FirstName,
 		&user.LastName,
+		&user.TimeZone,
+		&user.WorkStart,
+		&user.WorkEnd,
 		&user.DailyCapacity,
 		&workDays,
 		&user.CreatedAt,
@@ -34,7 +37,7 @@ func GetOrCreateUser(telegramID int64, username, firstName, lastName string) (*m
 		// Create new user
 		insertQuery := `INSERT INTO users (telegram_id, username, first_name, last_name)
 						VALUES ($1, $2, $3, $4)
-						RETURNING id, telegram_id, username, first_name, last_name, daily_capacity, work_days, created_at, updated_at`
+						RETURNING id, telegram_id, username, first_name, last_name, time_zone, work_start, work_end, daily_capacity, work_days, created_at, updated_at`
 
 		err = DB.QueryRow(insertQuery, telegramID, username, firstName, lastName).Scan(
 			&user.ID,
@@ -42,6 +45,9 @@ func GetOrCreateUser(telegramID int64, username, firstName, lastName string) (*m
 			&user.Username,
 			&user.FirstName,
 			&user.LastName,
+			&user.TimeZone,
+			&user.WorkStart,
+			&user.WorkEnd,
 			&user.DailyCapacity,
 			&workDays,
 			&user.CreatedAt,
@@ -63,20 +69,33 @@ func GetOrCreateUser(telegramID int64, username, firstName, lastName string) (*m
 	return user, nil
 }
 
-// UpdateUserSettings updates user's daily capacity and work days
-func UpdateUserSettings(userID int64, dailyCapacity float64, workDays []int) error {
+// UpdateUserSettings updates user's daily capacity, work days and work hours
+func UpdateUserSettings(userID int64, dailyCapacity float64, workDays []int, workStart, workEnd string) error {
 	// Convert []int to pq.Int64Array
 	workDaysArray := make(pq.Int64Array, len(workDays))
 	for i, v := range workDays {
 		workDaysArray[i] = int64(v)
 	}
 
-	query := `UPDATE users SET daily_capacity = $1, work_days = $2, updated_at = NOW()
-			  WHERE id = $3`
+	query := `UPDATE users SET daily_capacity = $1, work_days = $2, work_start = $3, work_end = $4, updated_at = NOW()
+			  WHERE id = $5`
 
-	_, err := DB.Exec(query, dailyCapacity, workDaysArray, userID)
+	_, err := DB.Exec(query, dailyCapacity, workDaysArray, workStart, workEnd, userID)
 	if err != nil {
 		return fmt.Errorf("failed to update user settings: %w", err)
+	}
+
+	return nil
+}
+
+// UpdateUserTimeZone updates user's time zone
+func UpdateUserTimeZone(userID int64, timeZone string) error {
+	query := `UPDATE users SET time_zone = $1, updated_at = NOW()
+			  WHERE id = $2`
+
+	_, err := DB.Exec(query, timeZone, userID)
+	if err != nil {
+		return fmt.Errorf("failed to update user time zone: %w", err)
 	}
 
 	return nil

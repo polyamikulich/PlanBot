@@ -5,6 +5,9 @@ CREATE TABLE IF NOT EXISTS users (
     username VARCHAR(255),
     first_name VARCHAR(255),
     last_name VARCHAR(255),
+    time_zone VARCHAR(255) DEFAULT 'Europe/Moscow',
+    work_start VARCHAR(5) DEFAULT '09:00',
+    work_end VARCHAR(5) DEFAULT '18:00',
     daily_capacity DECIMAL(5,2) DEFAULT 8.0, -- hours per day
     work_days INTEGER[] DEFAULT ARRAY[1,2,3,4,5], -- 1=Monday, 7=Sunday
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

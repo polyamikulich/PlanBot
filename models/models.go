@@ -11,6 +11,9 @@ type User struct {
 	Username      string
 	FirstName     string
 	LastName      string
+	TimeZone      string  // e.g. "Europe/Moscow"
+	WorkStart     string  // e.g. "09:00"
+	WorkEnd       string  // e.g. "18:00"
 	DailyCapacity float64 // hours per day
 	WorkDays      []int   // 1=Monday, 7=Sunday
 	CreatedAt     time.Time
@@ -70,4 +73,17 @@ type ScheduleResult struct {
 	Message          string
 	DaySchedules     []DaySchedule
 	UnscheduledTasks []int64 // IDs of tasks that couldn't be scheduled
+}
+
+// TimeSlot represents a concrete time interval inside a day
+// used for future fine-grained scheduling (by time of day).
+type TimeSlot struct {
+	UserID         int64
+	Date           time.Time   // calendar date in user's time zone
+	Start          time.Time   // exact start time
+	End            time.Time   // exact end time
+	CapacityHours  float64     // total capacity of this slot (usually 1.0 for 60 minutes)
+	AllocatedHours float64     // how many hours are already allocated
+	TaskID         *int64      // optional: ID of the task occupying this slot
+	Source         string      // e.g. "task", "external", "blocked", ""
 }
