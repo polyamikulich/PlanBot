@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"github.com/adkhorst/planbot/models"
 	"github.com/adkhorst/planbot/scheduler"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"golang.org/x/oauth2"
 )
 
 // Bot context for handlers
@@ -73,6 +73,12 @@ func (h *BotHandler) handleCommand(msg *tgbotapi.Message) {
 		h.handleSettings(msg)
 	case "timezone":
 		h.handleTimezone(msg)
+	case "google_connect":
+		h.handleGoogleConnect(msg)
+	case "google_code":
+		h.handleGoogleCode(msg)
+	case "google_status":
+		h.handleGoogleStatus(msg)
 	default:
 		h.sendMessage(msg.Chat.ID, "Неизвестная команда. Используйте /help")
 	}
@@ -127,6 +133,9 @@ func (h *BotHandler) handleHelp(msg *tgbotapi.Message) {
 /delete [ID] - Удалить задачу
 /settings - Настройки (часы в день, рабочие дни)
 /timezone [имя_таймзоны] - Установить таймзону (например, Europe/Moscow)
+/google_connect - Подключить Google Calendar (OAuth)
+/google_code [код] - Завершить подключение Google Calendar
+/google_status - Статус подключения Google Calendar
 
 💡 Советы:
 • Приоритет: целое число от 1 до 10 (10 = самый важный)
@@ -305,17 +314,27 @@ func (h *BotHandler) handleSchedule(msg *tgbotapi.Message) {
 		}
 	}
 
-	// Optional: export schedule to Google Calendar if access token is provided.
+	// Optional: export schedule to Google Calendar.
 	if len(result.DaySchedules) > 0 {
-		accessToken := os.Getenv("GOOGLE_CALENDAR_ACCESS_TOKEN")
-		if accessToken != "" {
-			ctx := context.Background()
-			c, err := googlecal.NewFromAccessToken(ctx, accessToken)
+		ctx := context.Background()
+
+		// Используем только токен из БД (Google OAuth).
+		if storedTok, err := database.GetGoogleToken(user.ID); err != nil {
+			log.Printf("Error getting Google token from DB: %v", err)
+		} else if storedTok != nil {
+			cfg, err := googlecal.ConfigFromEnv()
 			if err != nil {
-				log.Printf("Error creating Google Calendar client: %v", err)
+				log.Printf("Error creating Google OAuth config: %v", err)
 			} else {
-				if err := c.ExportDaySchedules(ctx, "primary", user, result.DaySchedules); err != nil {
-					log.Printf("Error exporting schedule to Google Calendar: %v", err)
+				client, err := googlecal.NewWithStoredToken(ctx, cfg, storedTok, func(t *oauth2.Token) error {
+					return database.SaveGoogleToken(user.ID, t)
+				})
+				if err != nil {
+					log.Printf("Error creating Google Calendar client with stored token: %v", err)
+				} else {
+					if err := client.ExportDaySchedules(ctx, "primary", user, result.DaySchedules); err != nil {
+						log.Printf("Error exporting schedule to Google Calendar (stored token): %v", err)
+					}
 				}
 			}
 		}
@@ -790,6 +809,116 @@ func (h *BotHandler) handleTimezone(msg *tgbotapi.Message) {
 
 	user.TimeZone = args
 	h.sendMessage(msg.Chat.ID, fmt.Sprintf("✅ Таймзона обновлена: %s", user.TimeZone))
+}
+
+// handleGoogleConnect инициирует OAuth-флоу: бот выдаёт ссылку для авторизации в Google.
+func (h *BotHandler) handleGoogleConnect(msg *tgbotapi.Message) {
+	user, err := h.getUser(msg.From.ID)
+	if err != nil {
+		h.sendMessage(msg.Chat.ID, "⚠️ Не удалось получить профиль пользователя.\nПопробуйте сначала выполнить команду /start.")
+		return
+	}
+
+	cfg, err := googlecal.ConfigFromEnv()
+	if err != nil {
+		log.Printf("Error building Google OAuth config: %v", err)
+		h.sendMessage(msg.Chat.ID, "⚠️ Интеграция с Google Calendar пока не настроена на сервере (отсутствуют GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET).")
+		return
+	}
+
+	// В качестве state можно использовать ID пользователя, чтобы минимально защититься от CSRF.
+	state := fmt.Sprintf("tguser-%d", user.ID)
+	authURL := cfg.AuthCodeURL(
+		state,
+		oauth2.AccessTypeOffline,
+		oauth2.SetAuthURLParam("prompt", "consent"),
+	)
+
+	text := fmt.Sprintf(`🔗 Подключение Google Calendar
+
+1) Перейдите по ссылке ниже и войдите в свой Google‑аккаунт.
+2) Разрешите доступ к календарю.
+3) Скопируйте выданный код подтверждения.
+4) Вернитесь в Telegram и отправьте команду:
+<code>/google_code ВАШ_КОД</code>
+
+Ссылка для авторизации:
+%s`, authURL)
+
+	h.sendMessage(msg.Chat.ID, text)
+}
+
+// handleGoogleCode принимает auth code от пользователя и сохраняет токены в БД.
+func (h *BotHandler) handleGoogleCode(msg *tgbotapi.Message) {
+	user, err := h.getUser(msg.From.ID)
+	if err != nil {
+		h.sendMessage(msg.Chat.ID, "⚠️ Не удалось получить профиль пользователя.\nПопробуйте сначала выполнить команду /start.")
+		return
+	}
+
+	code := strings.TrimSpace(msg.CommandArguments())
+	if code == "" {
+		h.sendMessage(msg.Chat.ID, "Отправьте код в формате:\n<code>/google_code ВАШ_КОД</code>")
+		return
+	}
+
+	cfg, err := googlecal.ConfigFromEnv()
+	if err != nil {
+		log.Printf("Error building Google OAuth config: %v", err)
+		h.sendMessage(msg.Chat.ID, "⚠️ Интеграция с Google Calendar пока не настроена на сервере (отсутствуют GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET).")
+		return
+	}
+
+	ctx := context.Background()
+	tok, err := cfg.Exchange(ctx, code)
+	if err != nil {
+		log.Printf("Error exchanging Google auth code: %v", err)
+		h.sendMessage(msg.Chat.ID, "❗️ Не удалось обменять код на токен.\nПроверьте, что вы используете свежий код и попробуйте ещё раз через /google_connect.")
+		return
+	}
+
+	if err := database.SaveGoogleToken(user.ID, tok); err != nil {
+		log.Printf("Error saving Google token: %v", err)
+		h.sendMessage(msg.Chat.ID, "❗️ Не удалось сохранить токен Google.\nПопробуйте позже.")
+		return
+	}
+
+	h.sendMessage(msg.Chat.ID, "✅ Google Calendar успешно подключен!\nТеперь при выполнении /schedule расписание будет выгружаться в ваш календарь.")
+}
+
+// handleGoogleStatus показывает, привязан ли Google Calendar к пользователю.
+func (h *BotHandler) handleGoogleStatus(msg *tgbotapi.Message) {
+	user, err := h.getUser(msg.From.ID)
+	if err != nil {
+		h.sendMessage(msg.Chat.ID, "⚠️ Не удалось получить профиль пользователя.\nПопробуйте сначала выполнить команду /start.")
+		return
+	}
+
+	tok, err := database.GetGoogleToken(user.ID)
+	if err != nil {
+		log.Printf("Error getting Google token: %v", err)
+		h.sendMessage(msg.Chat.ID, "Ошибка при получении статуса Google Calendar.")
+		return
+	}
+
+	if tok == nil {
+		h.sendMessage(msg.Chat.ID, "🔌 Google Calendar ещё не подключен.\nИспользуйте /google_connect, чтобы выдать доступ.")
+		return
+	}
+
+	now := time.Now()
+	status := "активен"
+	if tok.Expiry.Before(now) {
+		status = "истёк (будет автоматически обновлён при следующем экспорте, если есть refresh token)"
+	}
+
+	text := fmt.Sprintf(
+		"✅ Google Calendar подключен.\nСостояние токена: %s\nСрок действия access token до: %s",
+		status,
+		tok.Expiry.Format("02.01.2006 15:04"),
+	)
+
+	h.sendMessage(msg.Chat.ID, text)
 }
 
 // Helper functions

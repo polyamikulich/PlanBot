@@ -80,3 +80,12 @@ COMMENT ON TABLE users IS 'Telegram users with their scheduling preferences';
 COMMENT ON TABLE tasks IS 'User tasks with hours required and deadlines';
 COMMENT ON TABLE task_schedules IS 'Scheduled task allocations by day';
 
+-- Google OAuth tokens
+CREATE TABLE IF NOT EXISTS user_google_tokens (
+    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT NOT NULL,
+    expiry TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

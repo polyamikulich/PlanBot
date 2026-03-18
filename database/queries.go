@@ -7,6 +7,7 @@ import (
 
 	"github.com/adkhorst/planbot/models"
 	"github.com/lib/pq"
+	"golang.org/x/oauth2"
 )
 
 // GetOrCreateUser gets existing user or creates a new one
@@ -354,4 +355,49 @@ func GetScheduleForDateRange(userID int64, startDate, endDate time.Time) ([]mode
 	}
 
 	return schedules, nil
+}
+
+// GetGoogleToken returns stored Google OAuth token for user.
+func GetGoogleToken(userID int64) (*models.GoogleToken, error) {
+	query := `SELECT user_id, access_token, refresh_token, expiry, created_at, updated_at
+	          FROM user_google_tokens WHERE user_id = $1`
+
+	tok := &models.GoogleToken{}
+	err := DB.QueryRow(query, userID).Scan(
+		&tok.UserID,
+		&tok.AccessToken,
+		&tok.RefreshToken,
+		&tok.Expiry,
+		&tok.CreatedAt,
+		&tok.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get google token: %w", err)
+	}
+	return tok, nil
+}
+
+// SaveGoogleToken upserts user's Google OAuth token.
+func SaveGoogleToken(userID int64, token *oauth2.Token) error {
+	if token == nil {
+		return fmt.Errorf("nil token")
+	}
+	query := `
+		INSERT INTO user_google_tokens (user_id, access_token, refresh_token, expiry, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, NOW(), NOW())
+		ON CONFLICT (user_id) DO UPDATE
+		SET access_token = EXCLUDED.access_token,
+		    refresh_token = EXCLUDED.refresh_token,
+		    expiry = EXCLUDED.expiry,
+		    updated_at = NOW()
+	`
+
+	_, err := DB.Exec(query, userID, token.AccessToken, token.RefreshToken, token.Expiry)
+	if err != nil {
+		return fmt.Errorf("failed to save google token: %w", err)
+	}
+	return nil
 }

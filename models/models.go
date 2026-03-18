@@ -20,6 +20,15 @@ type User struct {
 	UpdatedAt     time.Time
 }
 
+type GoogleToken struct {
+	UserID       int64
+	AccessToken  string
+	RefreshToken string
+	Expiry       time.Time
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
 // Task represents a user's task
 type Task struct {
 	ID            int64
@@ -79,11 +88,11 @@ type ScheduleResult struct {
 // used for future fine-grained scheduling (by time of day).
 type TimeSlot struct {
 	UserID         int64
-	Date           time.Time   // calendar date in user's time zone
-	Start          time.Time   // exact start time
-	End            time.Time   // exact end time
-	CapacityHours  float64     // total capacity of this slot (usually 1.0 for 60 minutes)
-	AllocatedHours float64     // how many hours are already allocated
-	TaskID         *int64      // optional: ID of the task occupying this slot
-	Source         string      // e.g. "task", "external", "blocked", ""
+	Date           time.Time // calendar date in user's time zone
+	Start          time.Time // exact start time
+	End            time.Time // exact end time
+	CapacityHours  float64   // total capacity of this slot (usually 1.0 for 60 minutes)
+	AllocatedHours float64   // how many hours are already allocated
+	TaskID         *int64    // optional: ID of the task occupying this slot
+	Source         string    // e.g. "task", "external", "blocked", ""
 }
