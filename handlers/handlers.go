@@ -1,14 +1,17 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/adkhorst/planbot/database"
+	"github.com/adkhorst/planbot/googlecal"
 	"github.com/adkhorst/planbot/models"
 	"github.com/adkhorst/planbot/scheduler"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -299,6 +302,22 @@ func (h *BotHandler) handleSchedule(msg *tgbotapi.Message) {
 			log.Printf("Error saving schedules: %v", err)
 			h.sendMessage(msg.Chat.ID, "Ошибка сохранения расписания")
 			return
+		}
+	}
+
+	// Optional: export schedule to Google Calendar if access token is provided.
+	if len(result.DaySchedules) > 0 {
+		accessToken := os.Getenv("GOOGLE_CALENDAR_ACCESS_TOKEN")
+		if accessToken != "" {
+			ctx := context.Background()
+			c, err := googlecal.NewFromAccessToken(ctx, accessToken)
+			if err != nil {
+				log.Printf("Error creating Google Calendar client: %v", err)
+			} else {
+				if err := c.ExportDaySchedules(ctx, "primary", user, result.DaySchedules); err != nil {
+					log.Printf("Error exporting schedule to Google Calendar: %v", err)
+				}
+			}
 		}
 	}
 
