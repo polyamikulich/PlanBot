@@ -199,6 +199,48 @@ func GetPendingTasks(userID int64) ([]models.Task, error) {
 	return tasks, nil
 }
 
+// GetActiveTasks returns tasks that should participate in (re)planning.
+// "Hard" rescheduling treats all non-completed / non-cancelled tasks as current.
+func GetActiveTasks(userID int64) ([]models.Task, error) {
+	query := `
+		SELECT id, user_id, title, description, hours_required, priority, status, deadline,
+			   created_at, updated_at, completed_at
+		FROM tasks
+		WHERE user_id = $1 AND status NOT IN ('completed', 'cancelled')
+		ORDER BY priority DESC, deadline ASC NULLS LAST
+	`
+
+	rows, err := DB.Query(query, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active tasks: %w", err)
+	}
+	defer rows.Close()
+
+	tasks := []models.Task{}
+	for rows.Next() {
+		task := models.Task{}
+		err := rows.Scan(
+			&task.ID,
+			&task.UserID,
+			&task.Title,
+			&task.Description,
+			&task.HoursRequired,
+			&task.Priority,
+			&task.Status,
+			&task.Deadline,
+			&task.CreatedAt,
+			&task.UpdatedAt,
+			&task.CompletedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan active task: %w", err)
+		}
+		tasks = append(tasks, task)
+	}
+
+	return tasks, nil
+}
+
 // UpdateTaskStatus updates the status of a task
 func UpdateTaskStatus(taskID int64, status string) error {
 	query := `UPDATE tasks SET status = $1, updated_at = NOW() WHERE id = $2`

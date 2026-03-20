@@ -271,16 +271,16 @@ func (h *BotHandler) handleSchedule(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Get pending tasks
-	tasks, err := database.GetPendingTasks(user.ID)
+	// Hard rescheduling: plan for ALL active tasks (pending + already scheduled, etc.)
+	tasks, err := database.GetActiveTasks(user.ID)
 	if err != nil {
-		log.Printf("Error getting pending tasks: %v", err)
+		log.Printf("Error getting active tasks: %v", err)
 		h.sendMessage(msg.Chat.ID, "Ошибка получения задач из базы.\nПопробуйте позже.")
 		return
 	}
 
 	if len(tasks) == 0 {
-		h.sendMessage(msg.Chat.ID, "Нет задач для планирования.\nДобавьте новую задачу через /addtask.")
+		h.sendMessage(msg.Chat.ID, "Нет активных задач для планирования.\nДобавьте новую задачу через /addtask.")
 		return
 	}
 
@@ -312,6 +312,13 @@ func (h *BotHandler) handleSchedule(msg *tgbotapi.Message) {
 			h.sendMessage(msg.Chat.ID, "Ошибка сохранения расписания")
 			return
 		}
+	}
+
+	// Ensure task statuses are consistent after "hard" reschedule:
+	// - scheduled tasks stay/switch to 'scheduled' (SaveTaskSchedules does that)
+	// - unscheduled tasks should return to 'pending' (they may previously be 'scheduled')
+	for _, unscheduledID := range result.UnscheduledTasks {
+		_ = database.UpdateTaskStatus(unscheduledID, "pending")
 	}
 
 	// Optional: export schedule to Google Calendar.
@@ -372,10 +379,10 @@ func (h *BotHandler) handleScheduleSlots(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Get pending tasks
-	tasks, err := database.GetPendingTasks(user.ID)
+	// Show slot preview for the same set as /schedule hard rescheduling.
+	tasks, err := database.GetActiveTasks(user.ID)
 	if err != nil {
-		log.Printf("Error getting pending tasks: %v", err)
+		log.Printf("Error getting active tasks: %v", err)
 		h.sendMessage(msg.Chat.ID, "Ошибка получения задач из базы.\nПопробуйте позже.")
 		return
 	}
