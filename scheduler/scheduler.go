@@ -41,15 +41,16 @@ func (s *Scheduler) Schedule(startDate time.Time) *models.ScheduleResult {
 		UnscheduledTasks: []int64{},
 	}
 
-	// Filter only pending tasks
-	pendingTasks := s.filterPendingTasks()
-	if len(pendingTasks) == 0 {
+	// Hard rescheduling expects that we allocate all "active" tasks.
+	// We treat tasks as schedulable if they are not completed/cancelled.
+	schedulableTasks := s.filterSchedulableTasks()
+	if len(schedulableTasks) == 0 {
 		result.Message = "Нет задач для планирования"
 		return result
 	}
 
 	// Sort tasks by priority and deadline
-	sortedTasks := s.sortTasksByDeadlineAndPriority(pendingTasks)
+	sortedTasks := s.sortTasksByDeadlineAndPriority(schedulableTasks)
 
 	// Create day slots map
 	daySlots := make(map[string]*models.DaySchedule)
@@ -75,15 +76,16 @@ func (s *Scheduler) Schedule(startDate time.Time) *models.ScheduleResult {
 	return result
 }
 
-// filterPendingTasks returns only tasks with pending status
-func (s *Scheduler) filterPendingTasks() []models.Task {
-	pending := []models.Task{}
+// filterSchedulableTasks returns tasks that should participate in planning.
+// It excludes only completed/cancelled tasks.
+func (s *Scheduler) filterSchedulableTasks() []models.Task {
+	active := []models.Task{}
 	for _, task := range s.tasks {
-		if task.Status == "pending" {
-			pending = append(pending, task)
+		if task.Status != "completed" && task.Status != "cancelled" {
+			active = append(active, task)
 		}
 	}
-	return pending
+	return active
 }
 
 // sortTasksByDeadlineAndPriority sorts tasks by deadline (closest first) and priority

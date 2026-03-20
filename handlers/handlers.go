@@ -29,6 +29,12 @@ func NewBotHandler(bot *tgbotapi.BotAPI) *BotHandler {
 
 // HandleUpdate processes incoming updates
 func (h *BotHandler) HandleUpdate(update tgbotapi.Update) {
+	// Handle inline callbacks (buttons)
+	if update.CallbackQuery != nil {
+		h.handleCallback(update.CallbackQuery)
+		return
+	}
+
 	if update.Message == nil {
 		return
 	}
@@ -81,6 +87,29 @@ func (h *BotHandler) handleCommand(msg *tgbotapi.Message) {
 		h.handleGoogleStatus(msg)
 	default:
 		h.sendMessage(msg.Chat.ID, "Неизвестная команда. Используйте /help")
+	}
+}
+
+func (h *BotHandler) handleCallback(cb *tgbotapi.CallbackQuery) {
+	chatID := cb.Message.Chat.ID
+	telegramID := cb.From.ID
+
+	// Always answer callback to stop Telegram loading spinner.
+	_, _ = h.bot.Request(tgbotapi.NewCallback(cb.ID, ""))
+
+	user, err := h.getUser(telegramID)
+	if err != nil {
+		h.sendMessage(chatID, "⚠️ Не удалось получить профиль пользователя.")
+		return
+	}
+
+	switch cb.Data {
+	case "view_today":
+		h.sendTodaySchedule(chatID, user)
+	case "view_week":
+		h.sendWeekSchedule(chatID, user)
+	default:
+		h.sendMessage(chatID, "Неизвестное действие.")
 	}
 }
 
@@ -368,7 +397,14 @@ func (h *BotHandler) handleSchedule(msg *tgbotapi.Message) {
 		response += fmt.Sprintf("\n\n⚠️ Не удалось запланировать %d задач(и)", len(result.UnscheduledTasks))
 	}
 
-	h.sendMessage(msg.Chat.ID, response)
+	// Кнопки быстрого просмотра расписания (inline)
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📅 Сегодня", "view_today"),
+			tgbotapi.NewInlineKeyboardButtonData("📆 Неделя", "view_week"),
+		),
+	)
+	h.sendMessageWithReplyMarkup(msg.Chat.ID, response, &keyboard)
 }
 
 // handleScheduleSlots handles /schedule_slots command (experimental slot-based planning, no DB writes)
@@ -566,29 +602,7 @@ func (h *BotHandler) handleToday(msg *tgbotapi.Message) {
 		h.sendMessage(msg.Chat.ID, "Ошибка получения пользователя")
 		return
 	}
-
-	today := time.Now()
-	if user.TimeZone != "" {
-		if loc, err := time.LoadLocation(user.TimeZone); err == nil {
-			today = today.In(loc)
-		}
-	}
-	schedules, err := database.GetScheduleForDateRange(user.ID, today, today)
-	if err != nil {
-		log.Printf("Error getting schedule: %v", err)
-		h.sendMessage(msg.Chat.ID, "Ошибка получения расписания")
-		return
-	}
-
-	if len(schedules) == 0 {
-		h.sendMessage(msg.Chat.ID, "📭 На сегодня нет запланированных задач.\nПопробуйте команду /schedule, чтобы распланировать задачи.")
-		return
-	}
-
-	response := "📅 Сегодня:\n\n"
-	response += formatDaySchedule(schedules[0], user.DailyCapacity)
-
-	h.sendMessage(msg.Chat.ID, response)
+	h.sendTodaySchedule(msg.Chat.ID, user)
 }
 
 // handleWeek handles /week command
@@ -598,33 +612,7 @@ func (h *BotHandler) handleWeek(msg *tgbotapi.Message) {
 		h.sendMessage(msg.Chat.ID, "Ошибка получения пользователя")
 		return
 	}
-
-	today := time.Now()
-	if user.TimeZone != "" {
-		if loc, err := time.LoadLocation(user.TimeZone); err == nil {
-			today = today.In(loc)
-		}
-	}
-	endDate := today.AddDate(0, 0, 7)
-
-	schedules, err := database.GetScheduleForDateRange(user.ID, today, endDate)
-	if err != nil {
-		log.Printf("Error getting schedule: %v", err)
-		h.sendMessage(msg.Chat.ID, "Ошибка получения расписания")
-		return
-	}
-
-	if len(schedules) == 0 {
-		h.sendMessage(msg.Chat.ID, "📭 На эту неделю нет запланированных задач.\nПопробуйте команду /schedule, чтобы распланировать задачи.")
-		return
-	}
-
-	response := "📅 Расписание на неделю:\n\n"
-	for _, daySchedule := range schedules {
-		response += formatDaySchedule(daySchedule, user.DailyCapacity)
-	}
-
-	h.sendMessage(msg.Chat.ID, response)
+	h.sendWeekSchedule(msg.Chat.ID, user)
 }
 
 // handleComplete handles /complete command
@@ -935,12 +923,72 @@ func (h *BotHandler) getUser(telegramID int64) (*models.User, error) {
 }
 
 func (h *BotHandler) sendMessage(chatID int64, text string) {
+	h.sendMessageWithReplyMarkup(chatID, text, nil)
+}
+
+func (h *BotHandler) sendMessageWithReplyMarkup(chatID int64, text string, replyMarkup *tgbotapi.InlineKeyboardMarkup) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "HTML"
+	if replyMarkup != nil {
+		msg.ReplyMarkup = replyMarkup
+	}
 
 	if _, err := h.bot.Send(msg); err != nil {
 		log.Printf("Error sending message: %v", err)
 	}
+}
+
+func (h *BotHandler) sendTodaySchedule(chatID int64, user *models.User) {
+	today := time.Now()
+	if user.TimeZone != "" {
+		if loc, err := time.LoadLocation(user.TimeZone); err == nil {
+			today = today.In(loc)
+		}
+	}
+
+	schedules, err := database.GetScheduleForDateRange(user.ID, today, today)
+	if err != nil {
+		log.Printf("Error getting schedule: %v", err)
+		h.sendMessage(chatID, "Ошибка получения расписания")
+		return
+	}
+
+	if len(schedules) == 0 {
+		h.sendMessage(chatID, "📭 На сегодня нет запланированных задач.\nПопробуйте команду /schedule, чтобы распланировать задачи.")
+		return
+	}
+
+	response := "📅 Сегодня:\n\n"
+	response += formatDaySchedule(schedules[0], user.DailyCapacity)
+	h.sendMessage(chatID, response)
+}
+
+func (h *BotHandler) sendWeekSchedule(chatID int64, user *models.User) {
+	today := time.Now()
+	if user.TimeZone != "" {
+		if loc, err := time.LoadLocation(user.TimeZone); err == nil {
+			today = today.In(loc)
+		}
+	}
+	endDate := today.AddDate(0, 0, 7)
+
+	schedules, err := database.GetScheduleForDateRange(user.ID, today, endDate)
+	if err != nil {
+		log.Printf("Error getting schedule: %v", err)
+		h.sendMessage(chatID, "Ошибка получения расписания")
+		return
+	}
+
+	if len(schedules) == 0 {
+		h.sendMessage(chatID, "📭 На эту неделю нет запланированных задач.\nПопробуйте команду /schedule, чтобы распланировать задачи.")
+		return
+	}
+
+	response := "📅 Расписание на неделю:\n\n"
+	for _, daySchedule := range schedules {
+		response += formatDaySchedule(daySchedule, user.DailyCapacity)
+	}
+	h.sendMessage(chatID, response)
 }
 
 func getStatusEmoji(status string) string {
